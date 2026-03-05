@@ -2,9 +2,12 @@
 // fix_live_years.js — Fix year metadata for nugs.net live albums in Apple Music
 //
 // Usage:
-//   osascript -l JavaScript fix_live_years.js                      # dry run
-//   osascript -l JavaScript fix_live_years.js --commit             # apply
-//   osascript -l JavaScript fix_live_years.js --artist "Phish"     # single artist
+//   osascript -l JavaScript fix_live_years.js                      # dry run (all built-in artists)
+//   osascript -l JavaScript fix_live_years.js --commit             # apply changes
+//   osascript -l JavaScript fix_live_years.js --artist "Phish"     # built-in artist (with aliases)
+//   osascript -l JavaScript fix_live_years.js --artist "Orebolo"   # any artist (exact match)
+//   osascript -l JavaScript fix_live_years.js --artist "A" --artist "B"  # multiple artists
+//   osascript -l JavaScript fix_live_years.js --cloud-check        # also detect cloud-only tracks
 
 // ── Output Helpers (JXA has no console.log) ─────────────────────────────────
 
@@ -23,11 +26,25 @@ function printErr(msg) {
   _stderr.writeData(data);
 }
 
+// ── Timing ────────────────────────────────────────────────────────────────────
+
+function timer(label) {
+  var start = $.NSDate.date;
+  return {
+    stop: function() {
+      var elapsed = -ObjC.unwrap(start.timeIntervalSinceNow);
+      print('  [timer] ' + label + ': ' + elapsed.toFixed(1) + 's');
+      return elapsed;
+    }
+  };
+}
+
 // ── Configuration ───────────────────────────────────────────────────────────
 
 var ARTIST_ALIASES = {
   'Billy Strings': ['Billy Strings', 'Billy Strings & Friends'],
   'Goose':         ['Goose'],
+  'Grateful Dead': ['Grateful Dead', 'The Grateful Dead'],
   'Phish':         ['Phish']
 };
 
@@ -94,18 +111,25 @@ function buildSortAlbum(date, originalAlbum) {
 // ── CLI Argument Parsing ────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  var opts = { commit: false, artistFilter: null, customArtist: null };
+  var opts = { commit: false, artists: [], cloudCheck: false };
   for (var i = 0; i < argv.length; i++) {
     if (argv[i] === '--commit') {
       opts.commit = true;
-    } else if (argv[i] === '--artist' && i + 1 < argv.length) {
-      opts.artistFilter = argv[i + 1];
-      i++;
-    } else if (argv[i] === '--custom-artist' && i + 1 < argv.length) {
-      opts.customArtist = argv[i + 1];
+    } else if (argv[i] === '--cloud-check') {
+      opts.cloudCheck = true;
+    } else if ((argv[i] === '--artist' || argv[i] === '--custom-artist') && i + 1 < argv.length) {
+      var name = argv[i + 1];
+      if (name) opts.artists.push(name);
       i++;
     }
   }
+  // Deduplicate (case-sensitive — "Phish" and "phish" are different to Music.app)
+  var seen = {};
+  opts.artists = opts.artists.filter(function(a) {
+    if (seen[a]) return false;
+    seen[a] = true;
+    return true;
+  });
   return opts;
 }
 
@@ -134,21 +158,29 @@ function preflight(music) {
   return true;
 }
 
-function isCloudOnly(track) {
+function isCloudOnlyByLocation(loc) {
   try {
-    var loc = track.location();
-    if (!loc) return true;
+    // Batch location() returns null, $.nil, or missing value for cloud tracks
+    if (!loc || loc === $.nil) return true;
+    var locStr = loc.toString();
+    if (!locStr || locStr === 'msng' || locStr === '') return true;
     var fm = $.NSFileManager.defaultManager;
-    var path = ObjC.unwrap($(loc.toString()).stringByStandardizingPath);
+    var path = ObjC.unwrap($(locStr).stringByStandardizingPath);
     return !fm.fileExistsAtPath(path);
   } catch (e) {
-    return false;
+    return false;  // assume local on error
   }
+}
+
+function escapeForAppleScript(str) {
+  return str.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+            .replace(/\r/g, '\\r').replace(/\n/g, '\\n')
+            .replace(/\t/g, '\\t');
 }
 
 // ── Phase 1: Scan ───────────────────────────────────────────────────────────
 
-function scanArtist(music, artistKey, aliases) {
+function scanArtist(music, artistKey, aliases, cloudCheck) {
   var seen = {};
   var albums = {};
   var trackCount = 0;
@@ -162,18 +194,23 @@ function scanArtist(music, artistKey, aliases) {
     } catch (e) { continue; }
 
     // Batch property reads — one Apple Event per property for ALL matching tracks
-    var dbIds, albumNames, years, sortAlbums, trackNames;
+    var dbIds, albumNames, years, sortAlbums, locations;
     try {
       dbIds = trackSpec.databaseID();
       if (!dbIds || dbIds.length === 0) continue;
       albumNames = trackSpec.album();
       years = trackSpec.year();
       sortAlbums = trackSpec.sortAlbum();
-      trackNames = trackSpec.name();
     } catch (e) { continue; }
 
-    // We also need track references for the write phase
-    var trackRefs = trackSpec();
+    // location() costs 1 Apple Event per alias — only read when --cloud-check is set
+    if (cloudCheck) {
+      try {
+        locations = trackSpec.location();
+      } catch (e) {
+        locations = null;
+      }
+    }
 
     print('    ' + alias + ': ' + dbIds.length + ' tracks (batch read complete)');
 
@@ -185,23 +222,17 @@ function scanArtist(music, artistKey, aliases) {
       var albumName = albumNames[t];
       var year = years[t];
       var sortAlbum = sortAlbums[t] || '';
-      var trackName = trackNames[t];
-
-      // Cloud-only check — still per-track but only for tracks we'll write to
-      // Defer to build phase to avoid unnecessary IPC here
 
       if (!albums[albumName]) {
         var date = parseDateFromAlbum(albumName);
-        albums[albumName] = { date: date, tracks: [] };
+        albums[albumName] = { date: date, tracks: [], artistAlias: alias };
       }
 
       albums[albumName].tracks.push({
-        ref: trackRefs[t],
         year: year,
         sortAlbum: sortAlbum,
-        name: trackName,
         dbId: dbId,
-        cloudOnly: false,  // Checked lazily during fix plan
+        cloudOnly: (cloudCheck && locations) ? isCloudOnlyByLocation(locations[t]) : false,
         artist: alias
       });
       trackCount++;
@@ -229,19 +260,13 @@ function buildFixPlan(albumsMap) {
     for (var t = 0; t < info.tracks.length; t++) {
       var tr = info.tracks[t];
       var needsYear = (tr.year !== targetYear);
-      var hasValidSort = tr.sortAlbum && /^\d{4}-\d{2}-\d{2} /.test(tr.sortAlbum);
-      var needsSort = !hasValidSort;
+      var needsSort = (tr.sortAlbum !== targetSort);
 
       if (needsYear || needsSort) {
-        // Lazy cloud-only check — only for tracks that need fixing
-        var cloudOnly = false;
-        try { cloudOnly = isCloudOnly(tr.ref); } catch (e) { /* assume local */ }
-        if (cloudOnly) {
+        if (tr.cloudOnly) {
           cloudSkipped.push(tr);
         } else {
           tracksToFix.push({
-            ref: tr.ref,
-            name: tr.name,
             dbId: tr.dbId,
             artist: tr.artist,
             currentYear: tr.year,
@@ -258,6 +283,7 @@ function buildFixPlan(albumsMap) {
     if (tracksToFix.length > 0 || cloudSkipped.length > 0) {
       plan.push({
         album: albumName,
+        artistAlias: info.artistAlias,
         date: info.date,
         targetYear: targetYear,
         targetSort: targetSort,
@@ -332,17 +358,16 @@ function repeat(ch, n) {
 // ── Phase 1.5: Backup ──────────────────────────────────────────────────────
 
 function writeBackup(allPlans) {
-  var backup = [];
+  var yearSortChanges = [];
   for (var artistKey in allPlans) {
     var plan = allPlans[artistKey];
     for (var i = 0; i < plan.length; i++) {
       var p = plan[i];
       for (var t = 0; t < p.tracks.length; t++) {
         var tr = p.tracks[t];
-        backup.push({
+        yearSortChanges.push({
           artist: tr.artist,
           album: p.album,
-          trackName: tr.name,
           databaseID: tr.dbId,
           currentYear: tr.currentYear,
           currentSortAlbum: tr.currentSort,
@@ -353,14 +378,16 @@ function writeBackup(allPlans) {
     }
   }
 
-  if (backup.length === 0) return null;
+  if (yearSortChanges.length === 0) return null;
+
+  var backupObj = { yearSortChanges: yearSortChanges };
 
   var timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   var filename = 'itunes-year-fix-backup-' + timestamp + '.json';
   var homePath = ObjC.unwrap($.NSHomeDirectory());
   var filePath = homePath + '/.' + filename;
 
-  var json = JSON.stringify(backup, null, 2);
+  var json = JSON.stringify(backupObj, null, 2);
 
   var nsStr = $.NSString.alloc.initWithUTF8String(json);
   var nsPath = $(filePath);
@@ -379,9 +406,72 @@ function writeBackup(allPlans) {
 
 // ── Phase 2: Apply ──────────────────────────────────────────────────────────
 
-function applyFixes(allPlans) {
+function batchWriteAlbum(lib, p) {
+  var albumEsc = escapeForAppleScript(p.album);
+  var artistEsc = escapeForAppleScript(p.artistAlias);
+  var needsYear = p.tracks.some(function(t) { return t.fixYear; });
+  var needsSort = p.tracks.some(function(t) { return t.fixSort; });
+  var sortEsc = needsSort ? escapeForAppleScript(p.targetSort) : '';
+
+  var lines = ['tell application "Music"'];
+  lines.push('  set theTracks to every track of library playlist 1 whose album is "' +
+    albumEsc + '" and artist is "' + artistEsc + '"');
+  lines.push('  repeat with aTrack in theTracks');
+  if (needsYear) {
+    lines.push('    set year of aTrack to ' + p.targetYear);
+  }
+  if (needsSort) {
+    lines.push('    set sort album of aTrack to "' + sortEsc + '"');
+  }
+  lines.push('  end repeat');
+  lines.push('end tell');
+  var src = lines.join('\n');
+
+  var errPtr = Ref();
+  var script = $.NSAppleScript.alloc.initWithSource($(src));
+  var result = script.executeAndReturnError(errPtr);
+
+  if (!result) {
+    var errDict = errPtr[0];
+    var errMsg = 'unknown error';
+    if (errDict && errDict.objectForKey) {
+      var nsMsg = errDict.objectForKey($.NSAppleScriptErrorMessage);
+      if (nsMsg) errMsg = ObjC.unwrap(nsMsg);
+    }
+    throw new Error('AppleScript batch write failed: ' + errMsg);
+  }
+
+  return p.tracks.length;
+}
+
+function perTrackWriteAlbum(lib, p) {
+  var written = 0;
+  for (var t = 0; t < p.tracks.length; t++) {
+    var tr = p.tracks[t];
+    try {
+      var trackSpec = lib.tracks.whose({ databaseID: { _equals: tr.dbId } });
+      var refs = trackSpec();
+      if (!refs || refs.length === 0) {
+        print('    WARNING: track dbId ' + tr.dbId + ' not found, skipping');
+        continue;
+      }
+      var ref = refs[0];
+      if (tr.fixYear) ref.year = tr.targetYear;
+      if (tr.fixSort) ref.sortAlbum = tr.targetSort;
+      written++;
+    } catch (e) {
+      print('    ERROR on track dbId ' + tr.dbId + ': ' + e.message);
+    }
+  }
+  return written;
+}
+
+function applyFixes(allPlans, music) {
+  var lib = music.libraryPlaylists[0];
   var totalAlbums = 0;
   var totalTracks = 0;
+  var batchCount = 0;
+  var fallbackCount = 0;
   var errors = [];
 
   for (var artistKey in allPlans) {
@@ -391,31 +481,37 @@ function applyFixes(allPlans) {
 
     for (var i = 0; i < plan.length; i++) {
       var p = plan[i];
-      try {
-        for (var t = 0; t < p.tracks.length; t++) {
-          var tr = p.tracks[t];
-          if (tr.fixYear) {
-            tr.ref.year = tr.targetYear;
-          }
-          if (tr.fixSort) {
-            tr.ref.sortAlbum = tr.targetSort;
-          }
-          totalTracks++;
-        }
-        totalAlbums++;
+      if (p.tracks.length === 0) continue;
 
-        if (totalAlbums % 50 === 0) {
-          print('    ...updated ' + totalAlbums + ' albums (' + totalTracks + ' tracks)');
-        }
+      var written;
+      try {
+        written = batchWriteAlbum(lib, p);
+        totalTracks += written;
+        batchCount++;
       } catch (e) {
-        errors.push({ album: p.album, error: e.message });
-        print('    ERROR on "' + p.album + '": ' + e.message);
+        print('    Batch failed for "' + p.album + '": ' + e.message);
+        print('    Falling back to per-track writes...');
+        try {
+          written = perTrackWriteAlbum(lib, p);
+          totalTracks += written;
+          fallbackCount++;
+        } catch (e2) {
+          errors.push({ album: p.album, error: e2.message });
+          print('    ERROR (fallback) on "' + p.album + '": ' + e2.message);
+          continue;
+        }
+      }
+      totalAlbums++;
+
+      if (totalAlbums % 50 === 0) {
+        print('    ...updated ' + totalAlbums + ' albums (' + totalTracks + ' tracks)');
       }
     }
   }
 
   print('');
   print('  Done: ' + totalAlbums + ' albums, ' + totalTracks + ' tracks updated.');
+  print('  Batch writes: ' + batchCount + ', per-track fallbacks: ' + fallbackCount);
   if (errors.length > 0) {
     print('  Errors: ' + errors.length + ' albums failed (see above).');
   }
@@ -428,44 +524,96 @@ function applyFixes(allPlans) {
 function verify(music, allPlans) {
   print('');
   print('  Verifying changes...');
-  var mismatches = 0;
+  var lib = music.libraryPlaylists[0];
   var verified = 0;
+  var mismatches = 0;
+  var missing = 0;
+
+  // Build expected values keyed by databaseID from all plan entries
+  var expected = {};  // dbId → { targetYear, targetSort, fixYear, fixSort, album }
+  var aliasesNeeded = {};  // alias → true (collect unique aliases to query)
 
   for (var artistKey in allPlans) {
     var plan = allPlans[artistKey];
     for (var i = 0; i < plan.length; i++) {
       var p = plan[i];
+      if (p.tracks.length === 0) continue;
+      aliasesNeeded[p.artistAlias] = true;
       for (var t = 0; t < p.tracks.length; t++) {
         var tr = p.tracks[t];
-        try {
-          var actualYear = tr.ref.year();
-          var actualSort = tr.ref.sortAlbum() || '';
+        expected[tr.dbId] = {
+          targetYear: p.targetYear,
+          targetSort: p.targetSort,
+          fixYear: tr.fixYear,
+          fixSort: tr.fixSort,
+          album: p.album
+        };
+      }
+    }
+  }
 
-          var yearOk = !tr.fixYear || actualYear === tr.targetYear;
-          var sortOk = !tr.fixSort || actualSort === tr.targetSort;
+  var expectedCount = Object.keys(expected).length;
+  if (expectedCount === 0) {
+    print('  Nothing to verify.');
+    return 0;
+  }
 
-          if (yearOk && sortOk) {
-            verified++;
-          } else {
-            mismatches++;
-            if (mismatches <= 10) {
-              print('    MISMATCH: "' + tr.name + '" in "' + p.album + '"');
-              if (!yearOk) print('      year: expected ' + tr.targetYear + ', got ' + actualYear);
-              if (!sortOk) print('      sortAlbum: expected "' + tr.targetSort + '", got "' + actualSort + '"');
-            }
-          }
-        } catch (e) {
-          mismatches++;
+  // Query actual values per alias using single-predicate whose() — avoids _and bug
+  var actual = {};  // dbId → { year, sortAlbum }
+  var aliases = Object.keys(aliasesNeeded);
+  for (var a = 0; a < aliases.length; a++) {
+    var alias = aliases[a];
+    try {
+      var spec = lib.tracks.whose({ artist: { _equals: alias } });
+      var dbIds = spec.databaseID();
+      if (!dbIds || dbIds.length === 0) continue;
+      var years = spec.year();
+      var sorts = spec.sortAlbum();
+      for (var j = 0; j < dbIds.length; j++) {
+        if (expected[dbIds[j]]) {
+          actual[dbIds[j]] = { year: years[j], sortAlbum: sorts[j] };
         }
+      }
+    } catch (e) {
+      print('    ERROR querying artist "' + alias + '" for verify: ' + e.message);
+    }
+  }
+
+  // Compare expected vs actual by databaseID
+  var dbIds = Object.keys(expected);
+  for (var k = 0; k < dbIds.length; k++) {
+    var dbId = dbIds[k];
+    var exp = expected[dbId];
+    var act = actual[dbId];
+
+    if (!act) {
+      missing++;
+      continue;
+    }
+
+    var yearOk = !exp.fixYear || act.year === exp.targetYear;
+    var sortOk = !exp.fixSort || act.sortAlbum === exp.targetSort;
+
+    if (yearOk && sortOk) {
+      verified++;
+    } else {
+      mismatches++;
+      if (mismatches <= 10) {
+        print('    MISMATCH: dbId ' + dbId + ' in "' + exp.album + '"');
+        if (!yearOk) print('      year: expected ' + exp.targetYear + ', got ' + act.year);
+        if (!sortOk) print('      sortAlbum: expected "' + exp.targetSort + '", got "' + act.sortAlbum + '"');
       }
     }
   }
 
   print('  Verified: ' + verified + ' tracks OK, ' + mismatches + ' mismatches.');
+  if (missing > 0) {
+    print('  ' + missing + ' tracks not found (may be cloud-only or deleted)');
+  }
   if (mismatches > 10) {
     print('  (Showing first 10 mismatches only)');
   }
-  return mismatches;
+  return mismatches + missing;
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -475,40 +623,43 @@ function run(argv) {
 
   print('================================================================');
   print('  fix_live_years.js -- Fix nugs.net year metadata');
-  print('  Mode: ' + (opts.commit ? 'COMMIT (will write changes)' : 'DRY RUN (read-only)'));
+  var modeLabel = opts.commit ? 'COMMIT (will write changes)' : 'DRY RUN (read-only)';
+  if (opts.cloudCheck) modeLabel += ' +cloud-check';
+  print('  Mode: ' + modeLabel);
   print('================================================================');
   print('');
 
   // Determine target artists
   var targetArtists = {};
-  if (opts.customArtist) {
-    // Arbitrary artist — use the name as-is for exact matching
-    targetArtists[opts.customArtist] = [opts.customArtist];
-  } else if (opts.artistFilter) {
-    var filterLower = opts.artistFilter.toLowerCase();
-    var found = false;
-    for (var key in ARTIST_ALIASES) {
-      if (key.toLowerCase() === filterLower) {
-        targetArtists[key] = ARTIST_ALIASES[key];
-        found = true;
-        break;
+  if (opts.artists.length > 0) {
+    for (var ai = 0; ai < opts.artists.length; ai++) {
+      var name = opts.artists[ai];
+      // Case-insensitive lookup in built-in aliases
+      var matched = false;
+      var nameLower = name.toLowerCase();
+      for (var key in ARTIST_ALIASES) {
+        if (key.toLowerCase() === nameLower) {
+          targetArtists[key] = ARTIST_ALIASES[key];
+          matched = true;
+          break;
+        }
       }
-    }
-    if (!found) {
-      print('ERROR: Unknown artist "' + opts.artistFilter + '"');
-      print('Known artists: ' + Object.keys(ARTIST_ALIASES).join(', '));
-      print('Tip: Use --custom-artist "Name" for artists not in the built-in list.');
-      return;
+      if (!matched) {
+        print('  "' + name + '" not in built-in aliases; using exact match.');
+        targetArtists[name] = [name];
+      }
     }
   } else {
     targetArtists = ARTIST_ALIASES;
   }
 
   // Connect to Music.app
+  var tTotal = timer('total');
   print('  Connecting to Music.app...');
   var music = getMusic();
 
   // Preflight
+  var tPre = timer('preflight');
   print('  Running preflight checks...');
   try {
     preflight(music);
@@ -518,8 +669,10 @@ function run(argv) {
     print('  Make sure Music.app is open and has tracks in the library.');
     return;
   }
+  tPre.stop();
 
   // Phase 1: Scan
+  var tScan = timer('scan + fix plan');
   print('');
   print('  Scanning library...');
   var allPlans = {};
@@ -527,7 +680,7 @@ function run(argv) {
 
   for (var artistKey in targetArtists) {
     print('  Scanning ' + artistKey + '...');
-    var result = scanArtist(music, artistKey, targetArtists[artistKey]);
+    var result = scanArtist(music, artistKey, targetArtists[artistKey], opts.cloudCheck);
     print('    Found ' + result.trackCount + ' tracks across ' + Object.keys(result.albums).length + ' albums');
 
     var plan = buildFixPlan(result.albums);
@@ -535,6 +688,7 @@ function run(argv) {
     printPlan(plan, artistKey);
     grandTotalTracks += result.trackCount;
   }
+  tScan.stop();
 
   // Summary
   var totalFixAlbums = 0;
@@ -550,7 +704,8 @@ function run(argv) {
 
   print('');
   print('  =========================================');
-  print('  SUMMARY: ' + totalFixAlbums + ' albums, ' + totalFixTracks + ' tracks need fixes');
+  print('  SUMMARY:');
+  print('  Year/sort: ' + totalFixAlbums + ' albums, ' + totalFixTracks + ' tracks need fixes');
   if (totalCloudSkipped > 0) {
     print('  (plus ' + totalCloudSkipped + ' cloud-only tracks skipped)');
   }
@@ -568,41 +723,53 @@ function run(argv) {
   }
 
   // Phase 1.5: Backup
+  var tBackup = timer('backup');
   print('');
   print('  Writing backup...');
   var backupPath = writeBackup(allPlans);
   if (backupPath) {
     print('  Backup saved to: ' + backupPath);
   }
+  tBackup.stop();
 
   // Phase 2: Confirm & Apply
   print('');
-  print('  WARNING: About to update ' + totalFixAlbums + ' albums (' + totalFixTracks + ' tracks).');
-  print('  WARNING: Do NOT sync iCloud Music Library during this process.');
+  print('  WARNING: About to apply changes. Do NOT sync iCloud Music Library during this process.');
   print('');
 
-  // JXA doesn't have stdin — use a system dialog for confirmation
+  var dialogParts = ['fix_live_years.js will update:',
+    '  \u2022 ' + totalFixAlbums + ' albums (' + totalFixTracks + ' tracks) \u2014 year/sort',
+    '',
+    'Backup saved to:',
+    backupPath,
+    '',
+    'Do NOT sync iCloud Music Library during this process.',
+    '',
+    'Click OK to proceed or Cancel to abort.'];
+
   var currentApp = Application.currentApplication();
   currentApp.includeStandardAdditions = true;
   try {
     currentApp.displayDialog(
-      'fix_live_years.js will update ' + totalFixAlbums + ' albums (' + totalFixTracks + ' tracks).\n\n' +
-      'Backup saved to:\n' + backupPath + '\n\n' +
-      'Do NOT sync iCloud Music Library during this process.\n\n' +
-      'Click OK to proceed or Cancel to abort.',
-      { withTitle: 'Confirm Year Fix', buttons: ['Cancel', 'OK'], defaultButton: 'OK' }
+      dialogParts.join('\n'),
+      { withTitle: 'Confirm Fixes', buttons: ['Cancel', 'OK'], defaultButton: 'OK' }
     );
   } catch (e) {
     print('  Aborted by user.');
     return;
   }
 
-  // Apply
-  var applyResult = applyFixes(allPlans);
+  // Apply year/sort
+  var tApply = timer('apply');
+  var applyResult = applyFixes(allPlans, music);
+  tApply.stop();
 
-  // Verify
+  // Verify year/sort
+  var tVerify = timer('verify');
   var mismatches = verify(music, allPlans);
+  tVerify.stop();
 
+  tTotal.stop();
   print('');
   if (mismatches === 0 && applyResult.errors.length === 0) {
     print('  All changes verified successfully.');
